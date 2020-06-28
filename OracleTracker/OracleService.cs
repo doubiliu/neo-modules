@@ -1,6 +1,7 @@
 using Akka.Actor;
 using Neo;
 using Neo.Cryptography.ECC;
+using Neo.IO;
 using Neo.Ledger;
 using Neo.Network.P2P.Payloads;
 using Neo.Oracle.Protocols.Https;
@@ -33,6 +34,7 @@ namespace OracleTracker
         private static System.Timers.Timer _gcTimer;
         private static readonly TimeSpan TimeoutInterval = TimeSpan.FromMinutes(5);
 
+        private SnapshotView _latSnapshot;
         private readonly Func<SnapshotView> _snapshotFactory;
         private Func<OracleRequest, OracleResponse> Protocols { get; }
         private static IOracleProtocol HTTPSProtocol { get; } = new OracleHttpProtocol();
@@ -42,19 +44,18 @@ namespace OracleTracker
 
         internal class OracleTask
         {
-            public readonly DateTime Timestamp;
+            public readonly DateTime timeStamp;
             public UInt256 requestTxHash;
             public OracleRequest request;
-            public OracleResponse response;
             public ResponseCollection responseItems;
             private Object locker = new Object();
 
-            public OracleTask(UInt256 requestTxHash, OracleRequest request = null)
+            public OracleTask(UInt256 requestTxHash, OracleRequest request = null, StoreView snapshot = null)
             {
                 this.requestTxHash = requestTxHash;
                 this.request = request;
                 this.responseItems = new ResponseCollection();
-                this.Timestamp = TimeProvider.Current.UtcNow;
+                this.timeStamp = TimeProvider.Current.UtcNow;
             }
 
             public bool UpdateTaskState(OracleRequest request = null)
@@ -165,9 +166,9 @@ namespace OracleTracker
         {
             Protocols = Process;
             _accounts = new (Contract Contract, KeyPair Key)[0];
-            _snapshotFactory = new Func<SnapshotView>(() => Blockchain.Singleton.GetSnapshot());
+            _snapshotFactory = new Func<SnapshotView>(() => _latSnapshot ?? Blockchain.Singleton.GetSnapshot());
             _blockChain = blockChain;
-            _processingQueue = new BlockingCollection<OracleTask>(new ConcurrentQueue<OracleTask>(),capacity);
+            _processingQueue = new BlockingCollection<OracleTask>(new ConcurrentQueue<OracleTask>(), capacity);
             _pendingQueue = new ConcurrentDictionary<UInt256, OracleTask>();
         }
 
@@ -175,7 +176,7 @@ namespace OracleTracker
         {
             if (Interlocked.Exchange(ref _isStarted, 1) != 0) return false;
             if (numberOfTasks == 0) throw new ArgumentException("The task count must be greater than 0");
-            using var snapshot = _snapshotFactory();
+            using SnapshotView snapshot = _snapshotFactory();
             var oracles = NativeContract.Oracle.GetOracleValidators(snapshot)
                 .Select(u => Contract.CreateSignatureRedeemScript(u).ToScriptHash());
 
@@ -230,7 +231,8 @@ namespace OracleTracker
             _cancel = null;
             _oracleTasks = null;
             // Clean queue
-            while (true) {
+            while (true)
+            {
                 if (!_processingQueue.TryTake(out _)) break;
             }
             _pendingQueue.Clear();
@@ -243,7 +245,7 @@ namespace OracleTracker
             foreach (var outOfDateTask in _pendingQueue)
             {
                 DateTime now = TimeProvider.Current.UtcNow;
-                if (now - outOfDateTask.Value.Timestamp <= TimeoutInterval) break;
+                if (now - outOfDateTask.Value.timeStamp <= TimeoutInterval) break;
                 outOfDateTaskHashs.Add(outOfDateTask.Key);
             }
             foreach (UInt256 txHash in outOfDateTaskHashs)
@@ -252,15 +254,16 @@ namespace OracleTracker
             }
         }
 
-        public void SubmitRequest(Transaction tx)
+        public void SubmitRequest(SnapshotView snapshot, Transaction tx)
         {
+            _latSnapshot = snapshot;
             _processingQueue.Add(new OracleTask(tx.Hash));
         }
 
         public void ProcessRequest(OracleTask task)
         {
             Log($"Process oracle request: requestTx={task.requestTxHash}");
-            using var snapshot = _snapshotFactory();
+            SnapshotView snapshot = _snapshotFactory();
             RequestState requestState = NativeContract.Oracle.GetRequestState(snapshot, task.requestTxHash);
             if (requestState is null || requestState.Status != RequestStatusType.REQUEST) return;
             OracleRequest request = requestState.Request;
@@ -268,7 +271,7 @@ namespace OracleTracker
             var contract = Contract.CreateMultiSigContract(oraclePublicKeys.Length - (oraclePublicKeys.Length - 1) / 3, oraclePublicKeys);
 
             OracleResponse response = Protocols(request);
-            var responseTx = CreateResponseTransaction(snapshot, response, contract);
+            var responseTx = CreateResponseTransaction(snapshot.Clone(), response, contract);
             if (responseTx is null) return;
             Log($"Generated response tx: requestTx={task.requestTxHash} responseTx={responseTx.Hash}");
 
@@ -309,7 +312,7 @@ namespace OracleTracker
             }
         }
 
-        private static Transaction CreateResponseTransaction(SnapshotView snapshot, OracleResponse response, Contract contract)
+        private static Transaction CreateResponseTransaction(StoreView snapshot, OracleResponse response, Contract contract)
         {
             ScriptBuilder script = new ScriptBuilder();
             script.EmitAppCall(NativeContract.Oracle.Hash, "callBack");
@@ -336,12 +339,15 @@ namespace OracleTracker
                 Nonce = 0,
                 SystemFee = 0
             };
-            ScriptBuilder sb = new ScriptBuilder();
-            sb.EmitAppCall(NativeContract.Oracle.Hash, "onPersist");
-            snapshot.PersistingBlock = new Block() { Index = snapshot.Height + 1, Transactions = new Transaction[] { tx } };
-            var engine = new ApplicationEngine(TriggerType.System, null, snapshot, 0, true);
-            engine.LoadScript(sb.ToArray());
-            if (engine.Execute() != VMState.HALT) return null;
+            StorageKey storageKey = new StorageKey
+            {
+                Id = NativeContract.Oracle.Id,
+                Key = new byte[sizeof(byte) + UInt256.Length]
+            };
+            storageKey.Key[0] = 21;
+            response.RequestTxHash.ToArray().CopyTo(storageKey.Key.AsSpan(1));
+            RequestState requestState = snapshot.Storages.GetAndChange(storageKey)?.GetInteroperable<RequestState>();
+            requestState.Status = RequestStatusType.READY;
 
             var state = new TransactionState
             {
@@ -349,7 +355,7 @@ namespace OracleTracker
                 Transaction = tx
             };
             snapshot.Transactions.Add(tx.Hash, state);
-            engine = ApplicationEngine.Run(tx.Script, snapshot, tx, testMode: true);
+            var engine = ApplicationEngine.Run(tx.Script, snapshot, tx, testMode: true);
             if (engine.State != VMState.HALT) return null;
             tx.SystemFee = engine.GasConsumed;
             int size = tx.Size;
@@ -365,7 +371,7 @@ namespace OracleTracker
             if (requestState != null && requestState.Status != RequestStatusType.REQUEST) return;
             ECPoint[] oraclePublicKeys = NativeContract.Oracle.GetOracleValidators(snapshot);
             var contract = Contract.CreateMultiSigContract(oraclePublicKeys.Length - (oraclePublicKeys.Length - 1) / 3, oraclePublicKeys);
-            OracleTask task = new OracleTask(msg.OracleSignature.TransactionRequestHash, null);
+            OracleTask task = new OracleTask(msg.OracleSignature.TransactionRequestHash);
             task.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(msg), _blockChain, _pendingQueue);
             if (!_pendingQueue.TryAdd(msg.OracleSignature.TransactionRequestHash, task))
             {
@@ -389,11 +395,6 @@ namespace OracleTracker
                 default:
                     return OracleResponse.CreateError(request.RequestTxHash);
             }
-        }
-
-        private static int SortTask(KeyValuePair<UInt256, OracleTask> a, KeyValuePair<UInt256, OracleTask> b)
-        {
-            return a.Value.Timestamp.CompareTo(b.Value.Timestamp);
         }
     }
 }

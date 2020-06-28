@@ -1,7 +1,10 @@
+using Neo.IO.Json;
 using Neo.Ledger;
+using Neo.Persistence;
 using Neo.SmartContract.Native;
 using Neo.SmartContract.Native.Oracle;
 using Neo.SmartContract.Native.Tokens;
+using Newtonsoft.Json.Linq;
 using OracleTracker.Protocols;
 using System;
 using System.Linq;
@@ -9,6 +12,8 @@ using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
+using JArray = Newtonsoft.Json.Linq.JArray;
+using JObject = Newtonsoft.Json.Linq.JObject;
 
 namespace Neo.Oracle.Protocols.Https
 {
@@ -89,18 +94,38 @@ namespace Neo.Oracle.Protocols.Https
                 // Good response
                 ret = taskRet.Result;
             }
-
             // Filter
             using var snapshot = Blockchain.Singleton.GetSnapshot();
-
-            OracleFilter fiter = new OracleFilter() { ContractHash = request.CallBackContractHash, FilterMethod = request.FilterMethod, FilterArgs = request.FilterArgs };
-            if (!OracleFilter.Filter(snapshot, fiter, Encoding.UTF8.GetBytes(ret), out var output, out long FilterFee))
+            if (!Filter(snapshot, ret, request.FilterArgs, out var output, out long FilterFee))
             {
                 LogError(request.URL, "FilterError");
                 return OracleResponse.CreateError(request.RequestTxHash);
             }
 
-            return OracleResponse.CreateResult(request.RequestTxHash, output, FilterFee);
+            return OracleResponse.CreateResult(request.RequestTxHash, Encoding.UTF8.GetBytes(output), FilterFee);
+        }
+
+        private bool Filter(StoreView snapshot, string input, string filterArgs, out string result, out long gasCost)
+        {
+            if (filterArgs is null)
+            {
+                result = input;
+                gasCost = 0;
+            }
+            try
+            {
+                JObject beforeObject = JObject.Parse(input);
+                JArray afterObjects = new JArray(beforeObject.SelectTokens(filterArgs).ToArray());
+                result = afterObjects.ToString();
+                gasCost = (input.Length - result.Length) * NativeContract.Policy.GetFeePerByte(snapshot);
+            }
+            catch
+            {
+                result = null;
+                gasCost = 0;
+                return false;
+            }
+            return true;
         }
 
         private static void LogError(Uri url, string error)

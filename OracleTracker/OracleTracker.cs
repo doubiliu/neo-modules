@@ -13,7 +13,7 @@ using Neo;
 
 namespace OracleTracker
 {
-    public class OracleTracker : Plugin, IPersistencePlugin,IP2PPlugin
+    public class OracleTracker : Plugin, IPersistencePlugin, IP2PPlugin
     {
         private OracleService service;
 
@@ -24,9 +24,10 @@ namespace OracleTracker
 
         public bool OnP2PMessage(Message message)
         {
-            if (message.Command == MessageCommand.Oracle) {
+            if (message.Command == MessageCommand.Oracle)
+            {
                 OraclePayload payload = (OraclePayload)message.Payload;
-                StoreView snapshot=Blockchain.Singleton.GetSnapshot();
+                StoreView snapshot = Blockchain.Singleton.GetSnapshot();
                 if (!payload.Verify(snapshot)) return false;
                 service.SubmitOraclePayload(payload);
             }
@@ -38,14 +39,15 @@ namespace OracleTracker
             foreach (var appExec in applicationExecutedList)
             {
                 Transaction tx = appExec.Transaction;
-                VMState state= appExec.VMState;
-                if (tx is null|| state != VMState.HALT) continue;
-                var notify=appExec.Notifications.Where(q => {
-                    if (q.ScriptHash.Equals(NativeContract.Oracle.Hash)&&(q.EventName.Equals("Request"))) return true;
+                VMState state = appExec.VMState;
+                if (tx is null || state != VMState.HALT) continue;
+                var notify = appExec.Notifications.Where(q =>
+                {
+                    if (q.ScriptHash.Equals(NativeContract.Oracle.Hash) && (q.EventName.Equals("Request"))) return true;
                     return false;
                 }).FirstOrDefault();
                 if (notify is null) continue;
-                service.SubmitRequest(tx);
+                service.SubmitRequest((SnapshotView)snapshot.Clone(), tx);
             }
         }
 
