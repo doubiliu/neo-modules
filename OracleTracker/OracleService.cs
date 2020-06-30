@@ -23,7 +23,7 @@ using System.Timers;
 
 namespace OracleTracker
 {
-    class OracleService
+    public class OracleService
     {
         private (Contract Contract, KeyPair Key)[] _accounts;
         private readonly IActorRef _blockChain;
@@ -34,15 +34,15 @@ namespace OracleTracker
         private static System.Timers.Timer _gcTimer;
         private static readonly TimeSpan TimeoutInterval = TimeSpan.FromMinutes(5);
 
-        private SnapshotView _latSnapshot;
+        private SnapshotView _lastSnapshot;
         private readonly Func<SnapshotView> _snapshotFactory;
-        private Func<OracleRequest, OracleResponse> Protocols { get; }
+        private Func<OracleRequest, OracleResponseAttribute> Protocols { get; }
         private static IOracleProtocol HTTPSProtocol { get; } = new OracleHttpProtocol();
 
         private readonly BlockingCollection<OracleTask> _processingQueue;
         private readonly ConcurrentDictionary<UInt256, OracleTask> _pendingQueue;
 
-        internal class OracleTask
+        public class OracleTask
         {
             public readonly DateTime timeStamp;
             public UInt256 requestTxHash;
@@ -91,23 +91,21 @@ namespace OracleTracker
             }
         }
 
-        internal class ResponseItem
+        public class ResponseItem
         {
             public readonly Transaction Tx;
             public readonly OraclePayload Payload;
-            public readonly OracleResponseSignature Data;
             public readonly DateTime Timestamp;
             public ECPoint OraclePub => Payload.OraclePub;
-            public byte[] Signature => Data.Signature;
-            public UInt256 TransactionResponseHash => Data.TransactionResponseHash;
-            public UInt256 TransactionRequestHash => Data.TransactionRequestHash;
+            public byte[] Signature => Payload.Signature;
+            public UInt256 TransactionResponseHash => Payload.TransactionResponseHash;
+            public UInt256 TransactionRequestHash => Payload.TransactionRequestHash;
             public bool IsMine => Tx != null;
 
             public ResponseItem(OraclePayload payload, Transaction responseTx = null)
             {
                 this.Tx = responseTx;
                 this.Payload = payload;
-                this.Data = payload.OracleSignature;
                 this.Timestamp = TimeProvider.Current.UtcNow;
             }
 
@@ -117,7 +115,7 @@ namespace OracleTracker
             }
         }
 
-        internal class ResponseCollection : IEnumerable<ResponseItem>
+        public class ResponseCollection : IEnumerable<ResponseItem>
         {
             private readonly Dictionary<ECPoint, ResponseItem> _items = new Dictionary<ECPoint, ResponseItem>();
             public int Count => _items.Count;
@@ -166,7 +164,7 @@ namespace OracleTracker
         {
             Protocols = Process;
             _accounts = new (Contract Contract, KeyPair Key)[0];
-            _snapshotFactory = new Func<SnapshotView>(() => _latSnapshot ?? Blockchain.Singleton.GetSnapshot());
+            _snapshotFactory = new Func<SnapshotView>(() => _lastSnapshot ?? Blockchain.Singleton.GetSnapshot());
             _blockChain = blockChain;
             _processingQueue = new BlockingCollection<OracleTask>(new ConcurrentQueue<OracleTask>(), capacity);
             _pendingQueue = new ConcurrentDictionary<UInt256, OracleTask>();
@@ -256,21 +254,23 @@ namespace OracleTracker
 
         public void SubmitRequest(SnapshotView snapshot, Transaction tx)
         {
-            _latSnapshot = snapshot;
-            _processingQueue.Add(new OracleTask(tx.Hash));
+            if (_isStarted == 1)
+            {
+                _lastSnapshot = snapshot;
+                _processingQueue.Add(new OracleTask(tx.Hash));
+            }
         }
 
         public void ProcessRequest(OracleTask task)
         {
             Log($"Process oracle request: requestTx={task.requestTxHash}");
             SnapshotView snapshot = _snapshotFactory();
-            RequestState requestState = NativeContract.Oracle.GetRequestState(snapshot, task.requestTxHash);
-            if (requestState is null || requestState.Status != RequestStatusType.REQUEST) return;
-            OracleRequest request = requestState.Request;
+            OracleRequest request = NativeContract.Oracle.GetRequest(snapshot, task.requestTxHash);
+            if (request is null || request.Status != RequestStatusType.Request) return;
             ECPoint[] oraclePublicKeys = NativeContract.Oracle.GetOracleValidators(snapshot);
             var contract = Contract.CreateMultiSigContract(oraclePublicKeys.Length - (oraclePublicKeys.Length - 1) / 3, oraclePublicKeys);
 
-            OracleResponse response = Protocols(request);
+            OracleResponseAttribute response = Protocols(request);
             var responseTx = CreateResponseTransaction(snapshot.Clone(), response, contract);
             if (responseTx is null) return;
             Log($"Generated response tx: requestTx={task.requestTxHash} responseTx={responseTx.Hash}");
@@ -280,12 +280,9 @@ namespace OracleTracker
                 var response_payload = new OraclePayload()
                 {
                     OraclePub = account.Key.PublicKey,
-                    OracleSignature = new OracleResponseSignature()
-                    {
-                        TransactionResponseHash = responseTx.Hash,
-                        Signature = responseTx.Sign(account.Key),
-                        TransactionRequestHash = task.requestTxHash
-                    }
+                    TransactionResponseHash = responseTx.Hash,
+                    Signature = responseTx.Sign(account.Key),
+                    TransactionRequestHash = task.requestTxHash
                 };
 
                 var signatureMsg = response_payload.Sign(account.Key);
@@ -312,7 +309,7 @@ namespace OracleTracker
             }
         }
 
-        private static Transaction CreateResponseTransaction(StoreView snapshot, OracleResponse response, Contract contract)
+        private static Transaction CreateResponseTransaction(StoreView snapshot, OracleResponseAttribute response, Contract contract)
         {
             ScriptBuilder script = new ScriptBuilder();
             script.EmitAppCall(NativeContract.Oracle.Hash, "callBack");
@@ -327,10 +324,7 @@ namespace OracleTracker
                         AllowedContracts = new UInt160[]{ NativeContract.Oracle.Hash },
                         Scopes = WitnessScope.CalledByEntry
                     },
-                    new OracleResponseAttribute()
-                    {
-                         Response = response,
-                    }
+                    response
                 },
                 Sender = contract.ScriptHash,
                 Witnesses = new Witness[0],
@@ -346,8 +340,8 @@ namespace OracleTracker
             };
             storageKey.Key[0] = 21;
             response.RequestTxHash.ToArray().CopyTo(storageKey.Key.AsSpan(1));
-            RequestState requestState = snapshot.Storages.GetAndChange(storageKey)?.GetInteroperable<RequestState>();
-            requestState.Status = RequestStatusType.READY;
+            OracleRequest request = snapshot.Storages.GetAndChange(storageKey)?.GetInteroperable<OracleRequest>();
+            request.Status = RequestStatusType.Ready;
 
             var state = new TransactionState
             {
@@ -367,16 +361,19 @@ namespace OracleTracker
         public void SubmitOraclePayload(OraclePayload msg)
         {
             var snapshot = _snapshotFactory();
-            RequestState requestState = NativeContract.Oracle.GetRequestState(snapshot, msg.OracleSignature.TransactionRequestHash);
-            if (requestState != null && requestState.Status != RequestStatusType.REQUEST) return;
-            ECPoint[] oraclePublicKeys = NativeContract.Oracle.GetOracleValidators(snapshot);
-            var contract = Contract.CreateMultiSigContract(oraclePublicKeys.Length - (oraclePublicKeys.Length - 1) / 3, oraclePublicKeys);
-            OracleTask task = new OracleTask(msg.OracleSignature.TransactionRequestHash);
-            task.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(msg), _blockChain, _pendingQueue);
-            if (!_pendingQueue.TryAdd(msg.OracleSignature.TransactionRequestHash, task))
+            OracleRequest request = NativeContract.Oracle.GetRequest(snapshot, msg.TransactionRequestHash);
+            if (request != null && request.Status != RequestStatusType.Request) return;
+            if (_isStarted == 1)
             {
-                if (_pendingQueue.TryGetValue(task.requestTxHash, out OracleTask new_oracleTask))
-                    new_oracleTask.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(msg), _blockChain, _pendingQueue);
+                ECPoint[] oraclePublicKeys = NativeContract.Oracle.GetOracleValidators(snapshot);
+                var contract = Contract.CreateMultiSigContract(oraclePublicKeys.Length - (oraclePublicKeys.Length - 1) / 3, oraclePublicKeys);
+                OracleTask task = new OracleTask(msg.TransactionRequestHash);
+                task.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(msg), _blockChain, _pendingQueue);
+                if (!_pendingQueue.TryAdd(msg.TransactionRequestHash, task))
+                {
+                    if (_pendingQueue.TryGetValue(task.requestTxHash, out OracleTask new_oracleTask))
+                        new_oracleTask.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(msg), _blockChain, _pendingQueue);
+                }
             }
         }
 
@@ -385,7 +382,7 @@ namespace OracleTracker
             Utility.Log(nameof(OracleService), level, message);
         }
 
-        public static OracleResponse Process(OracleRequest request)
+        public static OracleResponseAttribute Process(OracleRequest request)
         {
             switch (request.URL.Scheme.ToLowerInvariant())
             {
@@ -393,7 +390,7 @@ namespace OracleTracker
                 case "https":
                     return HTTPSProtocol.Process(request);
                 default:
-                    return OracleResponse.CreateError(request.RequestTxHash);
+                    return OracleResponseAttribute.CreateError(request.RequestTxHash);
             }
         }
     }

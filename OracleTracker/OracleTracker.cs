@@ -10,16 +10,17 @@ using System.Collections.Generic;
 using System.Linq;
 using static Neo.Ledger.Blockchain;
 using Neo;
+using Akka.Actor;
 
 namespace OracleTracker
 {
     public class OracleTracker : Plugin, IPersistencePlugin, IP2PPlugin
     {
-        private OracleService service;
+        public OracleService service;
 
-        public OracleTracker()
+        public OracleTracker(IActorRef Blockchain = null)
         {
-            service = new OracleService(System.Blockchain, ProtocolSettings.Default.MemoryPoolMaxTransactions);
+            service = new OracleService(Blockchain ?? System.Blockchain, ProtocolSettings.Default.MemoryPoolMaxTransactions);
         }
 
         public bool OnP2PMessage(Message message)
