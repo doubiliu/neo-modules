@@ -2,8 +2,8 @@ using Neo.Ledger;
 using Neo.Network.P2P.Payloads;
 using Neo.Persistence;
 using Neo.SmartContract.Native;
-using Neo.SmartContract.Native.Oracle;
 using Neo.SmartContract.Native.Tokens;
+using OracleTracker;
 using OracleTracker.Protocols;
 using System;
 using System.Linq;
@@ -18,33 +18,20 @@ namespace Neo.Oracle.Protocols.Https
 {
     internal class OracleHttpProtocol : IOracleProtocol
     {
-        public HttpConfig Config { get; internal set; }
+        public int Timeout => 5000;
         public bool AllowPrivateHost { get; internal set; } = false;
 
-        public OracleHttpProtocol()
-        {
-            LoadConfig();
-        }
-
-        private void LoadConfig()
-        {
-            // Load the configuration
-            using (var snapshot = Blockchain.Singleton.GetSnapshot())
-            {
-                Config = (HttpConfig)NativeContract.Oracle.GetConfig(snapshot, HttpConfig.Key);
-            }
-        }
+        public readonly string[] AllowedFormats = new string[] { "application/json" };
 
         public OracleResponseAttribute Process(OracleRequest request)
         {
-            Log($"Downloading HTTPS request: url={request.URL.ToString()}", LogLevel.Debug);
-            LoadConfig();
-
-            if (!AllowPrivateHost && IsInternal(Dns.GetHostEntry(request.URL.Host)))
+            Log($"Downloading HTTPS request: url={request.Url}", LogLevel.Debug);
+            Uri.TryCreate(request.Url, UriKind.Absolute, out var uri);
+            if (!AllowPrivateHost && IsInternal(Dns.GetHostEntry(uri.Host)))
             {
                 // Don't allow private host in order to prevent SSRF
-                LogError(request.URL, "PolicyError");
-                return OracleResponseAttribute.CreateError(request.RequestTxHash);
+                LogError(uri, "PolicyError");
+                return OracleService.CreateError(request.RequestTxHash);
             }
 
             using var handler = new HttpClientHandler
@@ -54,39 +41,39 @@ namespace Neo.Oracle.Protocols.Https
             };
             using var client = new HttpClient(handler);
 
-            client.DefaultRequestHeaders.Add("Accept", string.Join(",", HttpConfig.AllowedFormats));
+            client.DefaultRequestHeaders.Add("Accept", string.Join(",", AllowedFormats));
 
-            Task<HttpResponseMessage> result = client.GetAsync(request.URL);
+            Task<HttpResponseMessage> result = client.GetAsync(uri);
 
-            if (!result.Wait(Config.Timeout))
+            if (!result.Wait(Timeout))
             {
                 // Timeout
-                LogError(request.URL, "Timeout");
-                return OracleResponseAttribute.CreateError(request.RequestTxHash);
+                LogError(uri, "Timeout");
+                return OracleService.CreateError(request.RequestTxHash);
             }
 
             if (!result.Result.IsSuccessStatusCode)
             {
                 // Error with response
-                LogError(request.URL, "ResponseError");
-                return OracleResponseAttribute.CreateError(request.RequestTxHash);
+                LogError(uri, "ResponseError");
+                return OracleService.CreateError(request.RequestTxHash);
             }
 
-            if (!HttpConfig.AllowedFormats.Contains(result.Result.Content.Headers.ContentType.MediaType))
+            if (!AllowedFormats.Contains(result.Result.Content.Headers.ContentType.MediaType))
             {
                 // Error with the ContentType
-                LogError(request.URL, "ContentType it's not allowed");
-                return OracleResponseAttribute.CreateError(request.RequestTxHash);
+                LogError(uri, "ContentType it's not allowed");
+                return OracleService.CreateError(request.RequestTxHash);
             }
 
             string ret;
             var taskRet = result.Result.Content.ReadAsStringAsync();
 
-            if (!taskRet.Wait(Config.Timeout))
+            if (!taskRet.Wait(Timeout))
             {
                 // Timeout
-                LogError(request.URL, "Timeout");
-                return OracleResponseAttribute.CreateError(request.RequestTxHash);
+                LogError(uri, "Timeout");
+                return OracleService.CreateError(request.RequestTxHash);
             }
             else
             {
@@ -97,11 +84,11 @@ namespace Neo.Oracle.Protocols.Https
             using var snapshot = Blockchain.Singleton.GetSnapshot();
             if (!Filter(snapshot, ret, request.FilterPath, out var output, out long FilterFee))
             {
-                LogError(request.URL, "FilterError");
-                return OracleResponseAttribute.CreateError(request.RequestTxHash);
+                LogError(uri, "FilterError");
+                return OracleService.CreateError(request.RequestTxHash);
             }
 
-            return OracleResponseAttribute.CreateResult(request.RequestTxHash, Encoding.UTF8.GetBytes(output), FilterFee);
+            return OracleService.CreateResult(request.RequestTxHash, Encoding.UTF8.GetBytes(output), FilterFee);
         }
 
         private bool Filter(StoreView snapshot, string input, string filterArgs, out string result, out long gasCost)

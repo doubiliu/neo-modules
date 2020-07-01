@@ -26,7 +26,7 @@ namespace OracleTracker
     public class OracleService
     {
         private (Contract Contract, KeyPair Key)[] _accounts;
-        private readonly IActorRef _blockChain;
+        private readonly OracleTracker _trackern;
 
         private long _isStarted = 0;
         private CancellationTokenSource _cancel;
@@ -64,7 +64,7 @@ namespace OracleTracker
                 return true;
             }
 
-            public bool AddResponseItem(Contract contract, ECPoint[] publicKeys, ResponseItem item, IActorRef _blockChain, ConcurrentDictionary<UInt256, OracleTask> _pendingQueue)
+            public bool AddResponseItem(Contract contract, ECPoint[] publicKeys, ResponseItem item, OracleTracker tracker, ConcurrentDictionary<UInt256, OracleTask> _pendingQueue)
             {
                 lock (locker)
                 {
@@ -83,8 +83,8 @@ namespace OracleTracker
                     {
                         mine_responseItem.Tx.Witnesses = responseTransactionContext.GetWitnesses();
                         Log($"Send response tx: responseTx={mine_responseItem.Tx.Hash}");
-                        _pendingQueue.TryRemove(mine_responseItem.TransactionRequestHash, out _);
-                        _blockChain.Tell(new Blockchain.RelayResult { Inventory = mine_responseItem.Tx });
+                        _pendingQueue.TryRemove(mine_responseItem.RequestTxHash, out _);
+                        tracker.SendMessage(new Blockchain.RelayResult { Inventory = mine_responseItem.Tx });
                     }
                 }
                 return true;
@@ -97,9 +97,8 @@ namespace OracleTracker
             public readonly OraclePayload Payload;
             public readonly DateTime Timestamp;
             public ECPoint OraclePub => Payload.OraclePub;
-            public byte[] Signature => Payload.Signature;
-            public UInt256 TransactionResponseHash => Payload.TransactionResponseHash;
-            public UInt256 TransactionRequestHash => Payload.TransactionRequestHash;
+            public byte[] Signature => Payload.ResponseTxSignature;
+            public UInt256 RequestTxHash => Payload.RequestTxHash;
             public bool IsMine => Tx != null;
 
             public ResponseItem(OraclePayload payload, Transaction responseTx = null)
@@ -160,12 +159,12 @@ namespace OracleTracker
             }
         }
 
-        public OracleService(IActorRef blockChain, int capacity)
+        public OracleService(OracleTracker tracker, int capacity)
         {
             Protocols = Process;
             _accounts = new (Contract Contract, KeyPair Key)[0];
             _snapshotFactory = new Func<SnapshotView>(() => _lastSnapshot ?? Blockchain.Singleton.GetSnapshot());
-            _blockChain = blockChain;
+            _trackern = tracker;
             _processingQueue = new BlockingCollection<OracleTask>(new ConcurrentQueue<OracleTask>(), capacity);
             _pendingQueue = new ConcurrentDictionary<UInt256, OracleTask>();
         }
@@ -280,9 +279,8 @@ namespace OracleTracker
                 var response_payload = new OraclePayload()
                 {
                     OraclePub = account.Key.PublicKey,
-                    TransactionResponseHash = responseTx.Hash,
-                    Signature = responseTx.Sign(account.Key),
-                    TransactionRequestHash = task.requestTxHash
+                    RequestTxHash = task.requestTxHash,
+                    ResponseTxSignature = responseTx.Sign(account.Key),
                 };
 
                 var signatureMsg = response_payload.Sign(account.Key);
@@ -290,21 +288,21 @@ namespace OracleTracker
 
                 if (signPayload.AddSignature(account.Contract, response_payload.OraclePub, signatureMsg) && signPayload.Completed)
                 {
-                    response_payload.Witness = signPayload.GetWitnesses()[0];
+                    response_payload.Witnesses = signPayload.GetWitnesses();
                     task.UpdateTaskState(request);
-                    task.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(response_payload, responseTx), _blockChain, _pendingQueue);
+                    task.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(response_payload, responseTx), _trackern, _pendingQueue);
                     if (!_pendingQueue.TryAdd(task.requestTxHash, task))
                     {
                         _pendingQueue.TryGetValue(task.requestTxHash, out OracleTask new_oracleTask);
                         if (new_oracleTask != null)
                         {
                             new_oracleTask.UpdateTaskState(task.request);
-                            new_oracleTask.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(response_payload, responseTx), _blockChain, _pendingQueue);
+                            new_oracleTask.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(response_payload, responseTx), _trackern, _pendingQueue);
                         }
                     }
 
                     Log($"Send oracle signature: oracle={response_payload.OraclePub} requestTx={task.requestTxHash} signaturePayload={response_payload.Hash}");
-                    _blockChain.Tell(new Blockchain.RelayResult { Inventory = response_payload, Result = VerifyResult.Succeed });
+                    _trackern.SendMessage(new Blockchain.RelayResult { Inventory = response_payload, Result = VerifyResult.Succeed });
                 }
             }
         }
@@ -312,7 +310,7 @@ namespace OracleTracker
         private static Transaction CreateResponseTransaction(StoreView snapshot, OracleResponseAttribute response, Contract contract)
         {
             ScriptBuilder script = new ScriptBuilder();
-            script.EmitAppCall(NativeContract.Oracle.Hash, "callBack");
+            script.EmitAppCall(NativeContract.Oracle.Hash, "callback");
             var tx = new Transaction()
             {
                 Version = 0,
@@ -320,13 +318,13 @@ namespace OracleTracker
                 Attributes = new TransactionAttribute[]{
                     new Cosigner()
                     {
-                        Account = NativeContract.Oracle.Hash,
+                        Account = contract.ScriptHash,
                         AllowedContracts = new UInt160[]{ NativeContract.Oracle.Hash },
                         Scopes = WitnessScope.CalledByEntry
                     },
                     response
                 },
-                Sender = contract.ScriptHash,
+                Sender = NativeContract.Oracle.Hash,
                 Witnesses = new Witness[0],
                 Script = script.ToArray(),
                 NetworkFee = 0,
@@ -361,18 +359,18 @@ namespace OracleTracker
         public void SubmitOraclePayload(OraclePayload msg)
         {
             var snapshot = _snapshotFactory();
-            OracleRequest request = NativeContract.Oracle.GetRequest(snapshot, msg.TransactionRequestHash);
+            OracleRequest request = NativeContract.Oracle.GetRequest(snapshot, msg.RequestTxHash);
             if (request != null && request.Status != RequestStatusType.Request) return;
             if (_isStarted == 1)
             {
                 ECPoint[] oraclePublicKeys = NativeContract.Oracle.GetOracleValidators(snapshot);
                 var contract = Contract.CreateMultiSigContract(oraclePublicKeys.Length - (oraclePublicKeys.Length - 1) / 3, oraclePublicKeys);
-                OracleTask task = new OracleTask(msg.TransactionRequestHash);
-                task.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(msg), _blockChain, _pendingQueue);
-                if (!_pendingQueue.TryAdd(msg.TransactionRequestHash, task))
+                OracleTask task = new OracleTask(msg.RequestTxHash);
+                task.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(msg), _trackern, _pendingQueue);
+                if (!_pendingQueue.TryAdd(msg.RequestTxHash, task))
                 {
                     if (_pendingQueue.TryGetValue(task.requestTxHash, out OracleTask new_oracleTask))
-                        new_oracleTask.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(msg), _blockChain, _pendingQueue);
+                        new_oracleTask.AddResponseItem(contract, oraclePublicKeys, new ResponseItem(msg), _trackern, _pendingQueue);
                 }
             }
         }
@@ -384,14 +382,30 @@ namespace OracleTracker
 
         public static OracleResponseAttribute Process(OracleRequest request)
         {
-            switch (request.URL.Scheme.ToLowerInvariant())
+            Uri.TryCreate(request.Url, UriKind.Absolute, out var uri);
+            switch (uri.Scheme.ToLowerInvariant())
             {
                 case "http":
                 case "https":
                     return HTTPSProtocol.Process(request);
                 default:
-                    return OracleResponseAttribute.CreateError(request.RequestTxHash);
+                    return CreateError(request.RequestTxHash);
             }
+        }
+
+        public static OracleResponseAttribute CreateError(UInt256 requestHash)
+        {
+            return CreateResult(requestHash, null, 0);
+        }
+
+        public static OracleResponseAttribute CreateResult(UInt256 requestTxHash, byte[] result, long filterCost)
+        {
+            return new OracleResponseAttribute()
+            {
+                RequestTxHash = requestTxHash,
+                Data = result,
+                FilterCost = filterCost
+            };
         }
     }
 }

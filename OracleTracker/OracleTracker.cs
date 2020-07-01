@@ -18,9 +18,9 @@ namespace OracleTracker
     {
         public OracleService service;
 
-        public OracleTracker(IActorRef Blockchain = null)
+        public OracleTracker()
         {
-            service = new OracleService(Blockchain ?? System.Blockchain, ProtocolSettings.Default.MemoryPoolMaxTransactions);
+            service = new OracleService(this, ProtocolSettings.Default.MemoryPoolMaxTransactions);
         }
 
         public bool OnP2PMessage(Message message)
@@ -50,6 +50,10 @@ namespace OracleTracker
                 if (notify is null) continue;
                 service.SubmitRequest((SnapshotView)snapshot.Clone(), tx);
             }
+        }
+
+        public virtual void SendMessage(RelayResult relayResult) {
+            System.Blockchain.Tell(relayResult);
         }
 
         public void StartOracle(Wallet wallet, byte numberOfTasks = 4)
