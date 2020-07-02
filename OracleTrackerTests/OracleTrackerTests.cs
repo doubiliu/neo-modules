@@ -27,6 +27,7 @@ namespace OracleTrackerTests
         [ClassInitialize]
         public static void TestSetup(TestContext ctx)
         {
+            Blockchain blockChain = new Blockchain(null, new );
             tracker = new TestOracleTracker();
             service = new OracleTracker.OracleService(tracker, 1000);
 
