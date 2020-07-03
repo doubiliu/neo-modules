@@ -31,7 +31,7 @@ namespace Neo.Oracle.Protocols.Https
             {
                 // Don't allow private host in order to prevent SSRF
                 LogError(uri, "PolicyError");
-                return OracleService.CreateError(request.RequestTxHash);
+                return OraclePreHandler.CreateError(request.RequestTxHash);
             }
 
             using var handler = new HttpClientHandler
@@ -49,21 +49,21 @@ namespace Neo.Oracle.Protocols.Https
             {
                 // Timeout
                 LogError(uri, "Timeout");
-                return OracleService.CreateError(request.RequestTxHash);
+                return OraclePreHandler.CreateError(request.RequestTxHash);
             }
 
             if (!result.Result.IsSuccessStatusCode)
             {
                 // Error with response
                 LogError(uri, "ResponseError");
-                return OracleService.CreateError(request.RequestTxHash);
+                return OraclePreHandler.CreateError(request.RequestTxHash);
             }
 
             if (!AllowedFormats.Contains(result.Result.Content.Headers.ContentType.MediaType))
             {
                 // Error with the ContentType
                 LogError(uri, "ContentType it's not allowed");
-                return OracleService.CreateError(request.RequestTxHash);
+                return OraclePreHandler.CreateError(request.RequestTxHash);
             }
 
             string ret;
@@ -73,7 +73,7 @@ namespace Neo.Oracle.Protocols.Https
             {
                 // Timeout
                 LogError(uri, "Timeout");
-                return OracleService.CreateError(request.RequestTxHash);
+                return OraclePreHandler.CreateError(request.RequestTxHash);
             }
             else
             {
@@ -85,10 +85,10 @@ namespace Neo.Oracle.Protocols.Https
             if (!Filter(snapshot, ret, request.FilterPath, out var output, out long FilterFee))
             {
                 LogError(uri, "FilterError");
-                return OracleService.CreateError(request.RequestTxHash);
+                return OraclePreHandler.CreateError(request.RequestTxHash);
             }
 
-            return OracleService.CreateResult(request.RequestTxHash, Encoding.UTF8.GetBytes(output), FilterFee);
+            return OraclePreHandler.CreateResult(request.RequestTxHash, Encoding.UTF8.GetBytes(output), FilterFee);
         }
 
         private bool Filter(StoreView snapshot, string input, string filterArgs, out string result, out long gasCost)

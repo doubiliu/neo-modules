@@ -178,12 +178,12 @@ namespace OracleTracker
             }
         }
 
-        private static void Log(string message, LogLevel level = LogLevel.Info)
+        public static void Log(string message, LogLevel level = LogLevel.Info)
         {
             Utility.Log(nameof(OraclePreHandler), level, message);
         }
 
-        public OracleResponseAttribute Process(OracleRequest request)
+        public static OracleResponseAttribute Process(OracleRequest request)
         {
             Uri.TryCreate(request.Url, UriKind.Absolute, out var uri);
             switch (uri.Scheme.ToLowerInvariant())
@@ -196,12 +196,12 @@ namespace OracleTracker
             }
         }
 
-        public OracleResponseAttribute CreateError(UInt256 requestHash)
+        public static OracleResponseAttribute CreateError(UInt256 requestHash)
         {
             return CreateResult(requestHash, null, 0);
         }
 
-        public OracleResponseAttribute CreateResult(UInt256 requestTxHash, byte[] result, long filterCost)
+        public static OracleResponseAttribute CreateResult(UInt256 requestTxHash, byte[] result, long filterCost)
         {
             return new OracleResponseAttribute()
             {
