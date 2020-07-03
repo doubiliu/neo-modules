@@ -23,44 +23,44 @@ namespace OracleTracker
 {
     public class OraclePreHandler : UntypedActor
     {
-        public IActorRef oraclePreHandler;
+        public IActorRef oraclePostHandler;
         public class ProcessRequestTask { public SnapshotView snapshot; public Transaction tx; }
         public class StartService { public Wallet wallet; }
         public class StopService { }
         public class ProcessOraclePayload { public OraclePayload payload; }
         private class Timer { }
 
-        private (Contract Contract, KeyPair Key)[] _accounts;
-        private readonly OracleTracker _trackern;
+        private (Contract Contract, KeyPair Key)[] accounts;
+        private readonly OracleTracker tracker;
 
-        private long _isStarted = 0;
+        private long isStarted = 0;
 
-        private SnapshotView _lastSnapshot;
-        private readonly Func<SnapshotView> _snapshotFactory;
+        private SnapshotView lastSnapshot;
+        private readonly Func<SnapshotView> snapshotFactory;
         private Func<OracleRequest, OracleResponseAttribute> Protocols { get; }
         private static IOracleProtocol HTTPSProtocol { get; } = new OracleHttpProtocol();
 
         public OraclePreHandler(IActorRef postHandler, OracleTracker tracker, int capacity)
         {
             Protocols = Process;
-            oraclePreHandler = postHandler;
-            _accounts = new (Contract Contract, KeyPair Key)[0];
-            _snapshotFactory = new Func<SnapshotView>(() => _lastSnapshot ?? Blockchain.Singleton.GetSnapshot());
-            _trackern = tracker;
+            oraclePostHandler = postHandler;
+            accounts = new (Contract Contract, KeyPair Key)[0];
+            snapshotFactory = new Func<SnapshotView>(() => lastSnapshot ?? Blockchain.Singleton.GetSnapshot());
+            this.tracker = tracker;
         }
 
         public bool OnStart(Wallet wallet)
         {
-            if (Interlocked.Exchange(ref _isStarted, 1) != 0) return false;
-            using SnapshotView snapshot = _snapshotFactory();
+            if (Interlocked.Exchange(ref isStarted, 1) != 0) return false;
+            using SnapshotView snapshot = snapshotFactory();
             var oracles = NativeContract.Oracle.GetOracleValidators(snapshot)
                 .Select(u => Contract.CreateSignatureRedeemScript(u).ToScriptHash());
 
-            _accounts = wallet?.GetAccounts()
+            accounts = wallet?.GetAccounts()
                 .Where(u => u.HasKey && !u.Lock && oracles.Contains(u.ScriptHash))
                 .Select(u => (u.Contract, u.GetKey()))
                 .ToArray();
-            if (_accounts.Length == 0)
+            if (accounts.Length == 0)
             {
                 throw new ArgumentException("The wallet doesn't have any oracle accounts");
             }
@@ -69,17 +69,17 @@ namespace OracleTracker
 
         public void OnStop()
         {
-            if (Interlocked.Exchange(ref _isStarted, 0) != 1) return;
+            if (Interlocked.Exchange(ref isStarted, 0) != 1) return;
             Log("OnStop");
-            _accounts = new (Contract Contract, KeyPair Key)[0];
+            accounts = new (Contract Contract, KeyPair Key)[0];
         }
 
         public void ProcessRequest(SnapshotView snapshot, Transaction tx)
         {
-            if (_isStarted != 1) return;
+            if (isStarted != 1) return;
             OracleTask task = new OracleTask(tx.Hash);
             Log($"Process oracle request: requestTx={task.requestTxHash}");
-            _lastSnapshot = snapshot;
+            lastSnapshot = snapshot;
             OracleRequest request = NativeContract.Oracle.GetRequest(snapshot, task.requestTxHash);
             if (request is null || request.Status != RequestStatusType.Request) return;
             ECPoint[] oraclePublicKeys = NativeContract.Oracle.GetOracleValidators(snapshot);
@@ -90,7 +90,7 @@ namespace OracleTracker
             if (responseTx is null) return;
             Log($"Generated response tx: requestTx={task.requestTxHash} responseTx={responseTx.Hash}");
 
-            foreach (var account in _accounts)
+            foreach (var account in accounts)
             {
                 var response_payload = new OraclePayload()
                 {
@@ -107,9 +107,9 @@ namespace OracleTracker
                     response_payload.Witnesses = signPayload.GetWitnesses();
                     task.request = request;
                     task.responseItems.Add(new ResponseItem(response_payload, responseTx));
-                    oraclePreHandler.Tell(new AddOrUpdateOracleTask() { snapshot = snapshot, task = task });
+                    oraclePostHandler.Tell(new AddOrUpdateOracleTask() { snapshot = snapshot, task = task });
                     Log($"Send oracle signature: oracle={response_payload.OraclePub} requestTx={task.requestTxHash} signaturePayload={response_payload.Hash}");
-                    _trackern.SendMessage(response_payload);
+                    tracker.SendMessage(response_payload);
                 }
             }
         }
@@ -165,16 +165,16 @@ namespace OracleTracker
 
         public void SubmitOraclePayload(OraclePayload msg)
         {
-            if (_isStarted != 1) return;
-            var snapshot = _snapshotFactory();
+            if (isStarted != 1) return;
+            var snapshot = snapshotFactory();
             if (!msg.Verify(snapshot)) throw new Exception("Invailed Data");
             OracleRequest request = NativeContract.Oracle.GetRequest(snapshot, msg.RequestTxHash);
             if (request != null && request.Status != RequestStatusType.Request) throw new Exception("Request has been finished");
-            if (_isStarted == 1)
+            if (isStarted == 1)
             {
                 OracleTask task = new OracleTask(msg.RequestTxHash);
                 task.responseItems.Add(new ResponseItem(msg));
-                oraclePreHandler.Tell(new AddOrUpdateOracleTask() { snapshot = snapshot, task = task });
+                oraclePostHandler.Tell(new AddOrUpdateOracleTask() { snapshot = snapshot, task = task });
             }
         }
 
