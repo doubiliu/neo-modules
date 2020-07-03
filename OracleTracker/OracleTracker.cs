@@ -1,6 +1,4 @@
-using Neo.Ledger;
 using Neo.Network.P2P.Payloads;
-using Neo.Network.P2P;
 using Neo.Persistence;
 using Neo.Plugins;
 using Neo.SmartContract.Native;
@@ -14,25 +12,22 @@ using Akka.Actor;
 
 namespace OracleTracker
 {
-    public class OracleTracker : Plugin, IPersistencePlugin, IP2PPlugin
+    public class OracleTracker : Plugin, IPersistencePlugin
     {
         public OracleService service;
+
+        public override string Description => "Oracle plugin";
 
         public OracleTracker()
         {
             service = new OracleService(this, ProtocolSettings.Default.MemoryPoolMaxTransactions);
+            RpcServerPlugin.RegisterMethods(this);
         }
 
-        public bool OnP2PMessage(Message message)
+        protected override void Configure()
         {
-            if (message.Command == MessageCommand.Oracle)
-            {
-                OraclePayload payload = (OraclePayload)message.Payload;
-                StoreView snapshot = Blockchain.Singleton.GetSnapshot();
-                if (!payload.Verify(snapshot)) return false;
-                service.SubmitOraclePayload(payload);
-            }
-            return true;
+            var nodes = GetConfiguration().GetSection("nodes").Value;
+            // connect other oracle nodes
         }
 
         public void OnPersist(StoreView snapshot, IReadOnlyList<ApplicationExecuted> applicationExecutedList)
