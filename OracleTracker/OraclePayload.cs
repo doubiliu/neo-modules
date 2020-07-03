@@ -4,6 +4,7 @@ using Neo.IO;
 using Neo.Network.P2P;
 using Neo.Network.P2P.Payloads;
 using Neo.Persistence;
+using Neo.SmartContract;
 using Neo.SmartContract.Native;
 using System;
 using System.IO;
@@ -61,6 +62,11 @@ namespace Neo.Plugins
             ECPoint[] validators = NativeContract.Oracle.GetOracleValidators(snapshot);
             if (!validators.Any(u => u.Equals(OraclePub))) return false;
             return this.VerifyWitnesses(snapshot, MaxWitnessGas);
+        }
+
+        public UInt160[] GetScriptHashesForVerifying(StoreView snapshot)
+        {
+            return new[] { Contract.CreateSignatureRedeemScript(OraclePub).ToScriptHash() };
         }
     }
 

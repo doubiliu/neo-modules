@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <Version>3.0.0-preview2</Version>
@@ -14,6 +14,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\neoUT\src\neo\neo.csproj" />
+    <ProjectReference Include="..\src\RpcServer\RpcServer.csproj" />
   </ItemGroup>
 
 </Project>
