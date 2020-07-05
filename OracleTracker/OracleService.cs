@@ -14,39 +14,41 @@ using Neo.VM;
 using Neo.Wallets;
 using OracleTracker.Protocols;
 using System;
+using System.IO;
 using System.Linq;
+using System.Net;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using static OracleTracker.OraclePostHandler;
 
 namespace OracleTracker
 {
-    public class OraclePreHandler : UntypedActor
+    public class OracleService : UntypedActor
     {
         public IActorRef oraclePostHandler;
-        public class ProcessRequestTask { public SnapshotView snapshot; public Transaction tx; }
+        public class ProcessRequest { public SnapshotView snapshot; public Transaction tx; }
         public class StartService { public Wallet wallet; }
         public class StopService { }
         public class ProcessOraclePayload { public OraclePayload payload; }
+        public class SendSignature { public OraclePayload payload; }
         private class Timer { }
 
         private (Contract Contract, KeyPair Key)[] accounts;
-        private readonly OracleTracker tracker;
-
+        private string[] nodes;
         private long isStarted = 0;
-
         private SnapshotView lastSnapshot;
         private readonly Func<SnapshotView> snapshotFactory;
         private Func<OracleRequest, OracleResponseAttribute> Protocols { get; }
         private static IOracleProtocol HTTPSProtocol { get; } = new OracleHttpProtocol();
 
-        public OraclePreHandler(IActorRef postHandler, OracleTracker tracker, int capacity)
+        public OracleService(IActorRef postHandler, string[] nodes)
         {
             Protocols = Process;
             oraclePostHandler = postHandler;
             accounts = new (Contract Contract, KeyPair Key)[0];
             snapshotFactory = new Func<SnapshotView>(() => lastSnapshot ?? Blockchain.Singleton.GetSnapshot());
-            this.tracker = tracker;
+            this.nodes = nodes;
         }
 
         public bool OnStart(Wallet wallet)
@@ -60,10 +62,7 @@ namespace OracleTracker
                 .Where(u => u.HasKey && !u.Lock && oracles.Contains(u.ScriptHash))
                 .Select(u => (u.Contract, u.GetKey()))
                 .ToArray();
-            if (accounts.Length == 0)
-            {
-                throw new ArgumentException("The wallet doesn't have any oracle accounts");
-            }
+            if (accounts.Length == 0) throw new ArgumentException("The wallet doesn't have any oracle accounts");
             return true;
         }
 
@@ -74,7 +73,7 @@ namespace OracleTracker
             accounts = new (Contract Contract, KeyPair Key)[0];
         }
 
-        public void ProcessRequest(SnapshotView snapshot, Transaction tx)
+        public void OnProcessRequest(SnapshotView snapshot, Transaction tx)
         {
             if (isStarted != 1) return;
             OracleTask task = new OracleTask(tx.Hash);
@@ -109,7 +108,7 @@ namespace OracleTracker
                     task.responseItems.Add(new ResponseItem(response_payload, responseTx));
                     oraclePostHandler.Tell(new AddOrUpdateOracleTask() { snapshot = snapshot, task = task });
                     Log($"Send oracle signature: oracle={response_payload.OraclePub} requestTx={task.requestTxHash} signaturePayload={response_payload.Hash}");
-                    tracker.SendMessage(response_payload);
+                    Self.Tell(new SendSignature() { payload = response_payload });
                 }
             }
         }
@@ -163,7 +162,7 @@ namespace OracleTracker
             return tx;
         }
 
-        public void SubmitOraclePayload(OraclePayload msg)
+        public void OnProcessOraclePayload(OraclePayload msg)
         {
             if (isStarted != 1) return;
             var snapshot = snapshotFactory();
@@ -178,9 +177,39 @@ namespace OracleTracker
             }
         }
 
+        public void OnSendSignature(OraclePayload payload)
+        {
+            new Task(() =>
+            {
+                foreach (var node in nodes)
+                {
+                    var url = new Uri("http://" + node + "/");
+                    HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url);
+
+                    request.Method = "POST";
+                    request.ContentType = "application/json";
+                    string data = payload.ToArray().ToHexString();
+                    string strContent = "[{\"data\":\"" + data + "\"}]";
+                    using (StreamWriter dataStream = new StreamWriter(request.GetRequestStream()))
+                    {
+                        dataStream.Write(strContent);
+                        dataStream.Close();
+                    }
+                    HttpWebResponse response = (HttpWebResponse)request.GetResponse();
+                    string encoding = response.ContentEncoding;
+                    if (encoding == null || encoding.Length < 1)
+                    {
+                        encoding = "UTF-8";
+                    }
+                    StreamReader reader = new StreamReader(response.GetResponseStream(), Encoding.GetEncoding(encoding));
+                    var retString = reader.ReadToEnd();
+                }
+            }).Start();
+        }
+
         public static void Log(string message, LogLevel level = LogLevel.Info)
         {
-            Utility.Log(nameof(OraclePreHandler), level, message);
+            Utility.Log(nameof(OracleService), level, message);
         }
 
         public static OracleResponseAttribute Process(OracleRequest request)
@@ -221,18 +250,21 @@ namespace OracleTracker
                 case StopService stop:
                     OnStop();
                     break;
-                case ProcessRequestTask request:
-                    new Task(() => ProcessRequest(request.snapshot, request.tx));
+                case ProcessRequest request:
+                    new Task(() => OnProcessRequest(request.snapshot, request.tx));
                     break;
                 case ProcessOraclePayload payload:
-                    new Task(() => SubmitOraclePayload(payload.payload));
+                    new Task(() => OnProcessOraclePayload(payload.payload));
+                    break;
+                case SendSignature sendSignature:
+                    OnSendSignature(sendSignature.payload);
                     break;
             }
         }
 
-        public static Props Props(IActorRef postHanler, OracleTracker tracker, int capacity)
+        public static Props Props(IActorRef postHanler, string[] nodes)
         {
-            return Akka.Actor.Props.Create(() => new OraclePreHandler(postHanler, tracker, capacity)).WithMailbox("OraclePreHandler-mailbox");
+            return Akka.Actor.Props.Create(() => new OracleService(postHanler, nodes)).WithMailbox("OraclePreHandler-mailbox");
         }
     }
 }

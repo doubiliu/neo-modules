@@ -37,7 +37,7 @@ namespace Neo.Plugins
             if (Witnesses.Length != 1) throw new FormatException();
         }
 
-     void IVerifiable.DeserializeUnsigned(BinaryReader reader)
+        void IVerifiable.DeserializeUnsigned(BinaryReader reader)
         {
             OraclePub = reader.ReadSerializable<ECPoint>();
             RequestTxHash = reader.ReadSerializable<UInt256>();
@@ -69,5 +69,4 @@ namespace Neo.Plugins
             return new[] { Contract.CreateSignatureRedeemScript(OraclePub).ToScriptHash() };
         }
     }
-
 }

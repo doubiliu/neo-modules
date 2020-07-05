@@ -10,7 +10,6 @@
     "MaxGasInvoke": 10,
     "MaxFee": 0.1,
     "MaxConcurrentConnections": 40,
-    "DisabledMethods": [ "openwallet" ],
-    "Nodes": [ "192.168.1.100", "192.168.1.101" ]
+    "DisabledMethods": [ "openwallet" ]
   }
 }
